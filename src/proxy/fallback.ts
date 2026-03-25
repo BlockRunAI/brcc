@@ -144,6 +144,15 @@ export function getCurrentModelFromChain(
   return config.chain[0];
 }
 
+// Provider-aware fallbacks for explicit model requests
+const PROVIDER_FALLBACKS: Record<string, string[]> = {
+  'anthropic': ['anthropic/claude-sonnet-4.6', 'anthropic/claude-haiku-4.5'],
+  'openai': ['openai/gpt-5.4', 'openai/gpt-5-mini'],
+  'google': ['google/gemini-2.5-pro', 'google/gemini-2.5-flash'],
+  'deepseek': ['deepseek/deepseek-chat'],
+  'xai': ['xai/grok-3', 'xai/grok-4-fast'],
+};
+
 /**
  * Build fallback chain starting from a specific model
  */
@@ -156,6 +165,17 @@ export function buildFallbackChain(
     // Start from this model and include all after it
     return config.chain.slice(index);
   }
-  // Model not in default chain - prepend it
-  return [startModel, ...config.chain];
+
+  // Model not in default chain - build provider-aware fallback
+  const provider = startModel.split('/')[0];
+  const providerFallbacks = PROVIDER_FALLBACKS[provider] || [];
+  
+  // Filter to models after the requested one in provider's list
+  const startIdx = providerFallbacks.indexOf(startModel);
+  const sameFamilyFallbacks = startIdx >= 0 
+    ? providerFallbacks.slice(startIdx + 1)
+    : providerFallbacks.filter(m => m !== startModel);
+
+  // Chain: requested model → same provider fallbacks → free model (skip smart routing)
+  return [startModel, ...sameFamilyFallbacks, 'nvidia/gpt-oss-120b'];
 }
