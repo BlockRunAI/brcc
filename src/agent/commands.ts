@@ -70,6 +70,77 @@ function emitDone(ctx: CommandContext) {
 
 // ─── Command Definitions ──────────────────────────────────────────────────
 
+// ─── Exchange grouping ────────────────────────────────────────────────────────
+// An "exchange" is one user text prompt + all following raw history entries
+// (tool calls, tool results, assistant replies) until the next user text prompt.
+// Operating on exchanges rather than raw indices guarantees the history stays
+// in valid user/assistant alternation after deletion.
+
+interface Exchange {
+  userText: string;
+  assistantText: string;
+  toolNames: string[];
+  startIdx: number; // inclusive raw history index
+  endIdx: number;   // inclusive raw history index
+}
+
+function buildExchanges(history: Dialogue[]): Exchange[] {
+  const exchanges: Exchange[] = [];
+  let i = 0;
+  while (i < history.length) {
+    const msg = history[i];
+    // Find the start of an exchange: a user message with real text content
+    if (msg.role !== 'user') { i++; continue; }
+    const userText = extractText(msg);
+    if (!userText) { i++; continue; } // skip tool_result-only user messages
+
+    const startIdx = i;
+    let endIdx = i;
+    let assistantText = '';
+    const toolNames: string[] = [];
+
+    // Consume everything until the next user-text message
+    let j = i + 1;
+    while (j < history.length) {
+      const next = history[j];
+      if (next.role === 'user' && extractText(next)) break; // next exchange starts
+      if (next.role === 'assistant') {
+        const t = extractText(next);
+        if (t && !assistantText) assistantText = t;
+        // Collect tool names
+        if (Array.isArray(next.content)) {
+          for (const p of next.content) {
+            if (p.type === 'tool_use' && !toolNames.includes(p.name)) {
+              toolNames.push(p.name);
+            }
+          }
+        }
+      }
+      endIdx = j;
+      j++;
+    }
+
+    exchanges.push({
+      userText: userText.slice(0, 120) + (userText.length > 120 ? '…' : ''),
+      assistantText: (assistantText.slice(0, 80) + (assistantText.length > 80 ? '…' : '')) || '(no text)',
+      toolNames,
+      startIdx,
+      endIdx,
+    });
+    i = j;
+  }
+  return exchanges;
+}
+
+function extractText(msg: Dialogue): string {
+  if (typeof msg.content === 'string') return msg.content.trim();
+  if (!Array.isArray(msg.content)) return '';
+  for (const p of msg.content) {
+    if (p.type === 'text' && p.text.trim()) return p.text.trim();
+  }
+  return '';
+}
+
 // Direct-handled commands (don't go to agent)
 const DIRECT_COMMANDS: Record<string, (ctx: CommandContext) => Promise<void> | void> = {
   '/stash': (ctx) => {
@@ -162,44 +233,25 @@ const DIRECT_COMMANDS: Record<string, (ctx: CommandContext) => Promise<void> | v
   '/history': (ctx) => {
     const { history, config } = ctx;
     const modelName = config.model.split('/').pop() || config.model;
-    let output = '**Conversation History**\n\n';
 
-    if (history.length === 0) {
+    // Group raw history entries into conversation exchanges.
+    // An exchange = one user text prompt + all following entries (tool calls,
+    // tool results, assistant replies) until the next user text prompt.
+    // This maps to what the user thinks of as "a turn" and is the safe unit to delete.
+    const exchanges = buildExchanges(history);
+
+    let output = '**Conversation History**\n\n';
+    if (exchanges.length === 0) {
       output += 'No history in the current session yet.\n';
     } else {
-      for (let i = 0; i < history.length; i++) {
-        const turn = history[i];
-        const rolePrefix = turn.role === 'user' ? '[user]' : `[${modelName}]`;
-        const numPrefix = `[${i + 1}]`;
-        let turnText = '';
-
-        if (typeof turn.content === 'string') {
-          turnText = turn.content;
-        } else if (Array.isArray(turn.content)) {
-          const textParts = turn.content
-            .filter(p => p.type === 'text' && p.text.trim())
-            .map(p => (p as { text: string }).text.trim());
-          
-          if (textParts.length > 0) {
-            turnText = textParts.join(' ');
-          } else {
-            const toolCall = turn.content.find(p => p.type === 'tool_use');
-            if (toolCall) {
-              turnText = `(Thinking and using tool: ${toolCall.name})`;
-            }
-            const toolResult = turn.content.find(p => p.type === 'tool_result');
-            if (toolResult) {
-              turnText = `(Processing tool result)`;
-            }
-          }
-        }
-        
-        if (turnText.trim()) {
-          output += `${numPrefix} ${rolePrefix} ${turnText.trim()}\n\n`;
-        }
+      for (let i = 0; i < exchanges.length; i++) {
+        const ex = exchanges[i];
+        const tools = ex.toolNames.length > 0 ? ` · used: ${ex.toolNames.join(', ')}` : '';
+        output += `[${i + 1}] [user] ${ex.userText}\n`;
+        output += `     [${modelName}] ${ex.assistantText}${tools}\n\n`;
       }
     }
-    output += '\nUse `/delete <number>` to remove turns (e.g., `/delete 2` or `/delete 3-5`).\n';
+    output += 'Use `/delete <number>` to remove exchanges (e.g., `/delete 2` or `/delete 3-5`).\n';
     ctx.onEvent({ kind: 'text_delta', text: output });
     emitDone(ctx);
   },
@@ -517,44 +569,46 @@ export async function handleSlashCommand(
       }
     }
 
+    // Map user-visible exchange numbers to raw history indices.
+    // Deleting by exchange guarantees valid user/assistant alternation —
+    // each exchange covers the user prompt + all its tool calls + assistant replies.
+    const exchanges = buildExchanges(ctx.history);
+
     if (indicesToDelete.size === 0) {
       ctx.onEvent({ kind: 'text_delta', text: 'No valid turn numbers provided.\n' });
       emitDone(ctx);
       return { handled: true };
     }
 
-    // Expand to include paired turns — the API requires strict user/assistant
-    // alternation. Deleting one half of a pair causes a 400 on the next call.
-    // For each selected index, also mark its paired neighbor:
-    //   - if selected turn is 'user', include the next turn (assistant response)
-    //   - if selected turn is 'assistant', include the previous turn (user message)
-    for (const index of Array.from(indicesToDelete)) {
-      const turn = ctx.history[index];
-      if (!turn) continue;
-      if (turn.role === 'user' && index + 1 < ctx.history.length) {
-        indicesToDelete.add(index + 1);
-      } else if (turn.role === 'assistant' && index - 1 >= 0) {
-        indicesToDelete.add(index - 1);
+    // Collect raw history index ranges to remove (descending to avoid shift)
+    const rawIndicesToDelete = new Set<number>();
+    for (const exIdx of indicesToDelete) {
+      const ex = exchanges[exIdx];
+      if (!ex) continue;
+      for (let i = ex.startIdx; i <= ex.endIdx; i++) {
+        rawIndicesToDelete.add(i);
       }
     }
 
-    const sortedIndices = Array.from(indicesToDelete).sort((a, b) => b - a); // Sort descending
+    const sortedRaw = Array.from(rawIndicesToDelete).sort((a, b) => b - a);
     let deletedCount = 0;
-    const deletedNumbers: number[] = [];
+    const deletedExchangeNums: number[] = [];
 
-    for (const index of sortedIndices) {
+    for (const index of sortedRaw) {
       if (index >= 0 && index < ctx.history.length) {
         ctx.history.splice(index, 1);
         deletedCount++;
-        deletedNumbers.push(index + 1);
       }
+    }
+    for (const exIdx of indicesToDelete) {
+      if (exchanges[exIdx]) deletedExchangeNums.push(exIdx + 1);
     }
 
     if (deletedCount > 0) {
       resetTokenAnchor();
-      ctx.onEvent({ kind: 'text_delta', text: `Deleted turn(s) ${deletedNumbers.reverse().join(', ')} from history.\n` });
+      ctx.onEvent({ kind: 'text_delta', text: `Deleted exchange(s) ${deletedExchangeNums.sort((a,b)=>a-b).join(', ')} from history.\n` });
     } else {
-      ctx.onEvent({ kind: 'text_delta', text: `No matching turns found to delete.\n` });
+      ctx.onEvent({ kind: 'text_delta', text: `No matching exchanges found to delete.\n` });
     }
 
     emitDone(ctx);
