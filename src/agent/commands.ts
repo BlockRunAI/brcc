@@ -523,6 +523,21 @@ export async function handleSlashCommand(
       return { handled: true };
     }
 
+    // Expand to include paired turns — the API requires strict user/assistant
+    // alternation. Deleting one half of a pair causes a 400 on the next call.
+    // For each selected index, also mark its paired neighbor:
+    //   - if selected turn is 'user', include the next turn (assistant response)
+    //   - if selected turn is 'assistant', include the previous turn (user message)
+    for (const index of Array.from(indicesToDelete)) {
+      const turn = ctx.history[index];
+      if (!turn) continue;
+      if (turn.role === 'user' && index + 1 < ctx.history.length) {
+        indicesToDelete.add(index + 1);
+      } else if (turn.role === 'assistant' && index - 1 >= 0) {
+        indicesToDelete.add(index - 1);
+      }
+    }
+
     const sortedIndices = Array.from(indicesToDelete).sort((a, b) => b - a); // Sort descending
     let deletedCount = 0;
     const deletedNumbers: number[] = [];
